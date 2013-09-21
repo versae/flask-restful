@@ -1,7 +1,7 @@
 import difflib
 from functools import wraps, partial
 import re
-from flask import request, Response, url_for
+from flask import current_app, request, Response, url_for
 from flask import abort as original_flask_abort
 from flask.views import MethodView
 from flask.signals import got_request_exception
@@ -242,6 +242,7 @@ class Api(object):
         resource.mediatypes = self.mediatypes_method()  # Hacky
         resource.endpoint = endpoint
         resource_func = self.output(resource.as_view(endpoint))
+        resource_func = self.smart_options(resource_func)
 
         for decorator in self.decorators:
             resource_func = decorator(resource_func)
@@ -249,6 +250,45 @@ class Api(object):
 
         for url in urls:
             self.app.add_url_rule(self.prefix + url, view_func=resource_func, **kwargs)
+
+
+    def smart_options(self, resource):
+        """Wraps a resource (as a flask view function), for cases where the
+        resource needs an `option` method for cross-domain requests
+
+        :param resource: The resource as a flask view function
+        """
+        if resource.methods and not hasattr(resource, "options"):
+            methods = list(resource.methods)
+            for method in ["GET", "HEAD", "POST"]:  # simple methods
+                if method in methods:
+                    methods.remove(method)
+            if len(methods) != 0:
+                resource.provide_automatic_options = False
+                if "OPTIONS" not in resource.methods:
+                    resource.methods += ["OPTIONS"]
+
+                def options(self):
+                    resp = current_app.make_default_options_response()
+                    request_method_header = "Access-Control-Request-Method"
+                    if request_method_header in request.headers:
+                        request_method = request.headers[request_method_header]
+                        if request_method in resource.methods:
+                            method_name = request_method.lower()
+                            func = getattr(resource.view_class, method_name)
+                            decorator = getattr(func, "cors_decorator", None)
+                            if not decorator and hasattr(func, "im_class"):
+                                decorator = getattr(func.im_class,
+                                                    "cors_decorator", None)
+                            if decorator:
+                                headers = decorator.get_headers(func)
+                                for header in headers.items():
+                                    resp.headers.add_header(*header)
+                                return resp
+                    return resp
+
+                resource.view_class.options = options
+        return resource
 
     def output(self, resource):
         """Wraps a resource (as a flask view function), for cases where the
@@ -268,7 +308,7 @@ class Api(object):
     def url_for(self, resource, **values):
         """Generates a URL to the given resource."""
         return url_for(resource.endpoint, **values)
-        
+
     def make_response(self, data, *args, **kwargs):
         """Looks up the representation transformer for the requested media
         type, invoking the transformer to create a response object. This
